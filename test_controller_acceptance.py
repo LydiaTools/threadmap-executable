@@ -68,6 +68,41 @@ class ControllerAcceptance(unittest.TestCase):
         before=copy.deepcopy(self.store.data)
         with self.assertRaises(ValueError): self.app.apply_proposal({'proposalId':'bad'})
         self.assertEqual(self.store.data,before)
+    def test_manual_added_step_is_runnable_execution_node(self):
+        child=self.app.add_child({'parentId':'idea','title':'手动做这一步'})
+        self.assertEqual(child['kind'],'execution')
+        self.app.execute({'nodeId':child['id'],'revision':child['revision'],'prompt':'test'})
+        self.assertEqual(child['status'],'running')
+    def test_pending_proposal_blocks_second_plan_until_discarded(self):
+        self.store.data['pendingProposal']={'proposalId':'one','turnId':'turn-one','parentId':'idea','nodes':[{'tempId':'a','title':'A','kind':'execution'}]}
+        with self.assertRaisesRegex(ValueError,'上一份拆分结果'):
+            self.app.plan({'parentId':'plan','idea':'B'})
+        self.assertEqual(self.store.data['pendingProposal']['proposalId'],'one')
+        self.assertEqual(self.rpc.calls,[])
+        self.app.discard_proposal({'proposalId':'one'})
+        self.assertEqual(self.store.node('idea')['planningStatus'],'discarded')
+        self.app.plan({'parentId':'plan','idea':'B'})
+        self.assertEqual(self.store.node('plan')['planningStatus'],'running')
+    def test_pending_proposal_survives_reopen(self):
+        self.store.data['pendingProposal']={'proposalId':'one','turnId':'turn-one','parentId':'idea','nodes':[{'tempId':'a','title':'A','kind':'execution'}]}
+        self.store.write()
+        reopened=s.Store()
+        self.assertEqual(reopened.data['pendingProposal']['proposalId'],'one')
+    def test_thread_start_timeout_is_preparation_failure_without_model_budget(self):
+        def timeout_start(n,prompt):
+            e=s.RPCReceiptTimeout('thread/start',77,'fake-rpc');e.phase='thread/start';raise e
+        self.rpc.start=timeout_start
+        with self.assertRaisesRegex(RuntimeError,'回执超时'): self.app.plan({'parentId':'plan','idea':'test'})
+        self.assertEqual(self.n['planningStatus'],'preparation_failed')
+        self.assertEqual(self.store.data['runsUsed'],0)
+        self.assertEqual(self.n['attempts'][-1]['phase'],'thread/start')
+        self.assertFalse(self.n['attempts'][-1]['modelTurnStarted'])
+    def test_late_reply_requires_the_same_rpc_instance(self):
+        self.rpc.instance_id='new-rpc'
+        self.n['attempts']=[{'rpcRequestId':7,'rpcInstanceId':'old-rpc','phase':'thread/start','state':'preparation_failed'}]
+        out=self.app.recover_late_reply({'nodeId':'plan'})
+        self.assertEqual(out['status'],'unavailable')
+        self.assertEqual(self.n['attempts'][0]['rpcRequestId'],7)
     def test_corrupt_state_is_preserved_without_resetting_budget(self):
         s.STATE.write_text('{invalid-json')
         with self.assertRaises(RuntimeError): s.Store()

@@ -39,12 +39,16 @@ class Store:
       if n['id']==i:return n
     raise ValueError('找不到节点')
 
+class RPCReceiptTimeout(RuntimeError):
+  def __init__(self,method,request_id,instance_id):super().__init__('等待 Codex 回执超时；请求状态未知，请勿重发');self.method=method;self.request_id=request_id;self.instance_id=instance_id;self.phase=None
+
 class CodexRPC:
   def __init__(self,binary=CODEX):
     if not os.path.isfile(binary) or not os.access(binary,os.X_OK):raise RuntimeError('未找到桌面版 Codex binary')
-    self.p=subprocess.Popen([binary,'app-server','--stdio'],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True,bufsize=1)
-    self.lock=threading.RLock(); self.pending={}; self.events=collections.deque(maxlen=200); self.seq=0
+    self.p=subprocess.Popen([binary,'app-server','--stdio'],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,bufsize=1)
+    self.lock=threading.RLock(); self.instance_id=str(uuid.uuid4());self.pending={}; self.events=collections.deque(maxlen=200); self.stderr_count=0; self.seq=0
     threading.Thread(target=self.reader,daemon=True).start()
+    threading.Thread(target=self.stderr_reader,daemon=True).start()
     self.call('initialize',{'clientInfo':{'name':'threadmap_local_executor','title':'任务脉络本地执行器','version':'0.2.0'},'capabilities':{'experimentalApi':True}}); self.send({'method':'initialized','params':{}})
   def send(self,m):self.p.stdin.write(json.dumps(m,ensure_ascii=False)+'\n');self.p.stdin.flush()
   def reader(self):
@@ -52,8 +56,14 @@ class CodexRPC:
       try:m=json.loads(line)
       except json.JSONDecodeError:continue
       with self.lock:
-        if 'id' in m:self.pending[str(m['id'])]=m
+        if 'id' in m and 'method' in m:
+          self.events.append({'method':'server/request/rejected','params':{'method':str(m['method'])[:120]}})
+          self.send({'id':m['id'],'error':{'code':-32601,'message':'This client does not support server requests'}})
+        elif 'id' in m:self.pending[str(m['id'])]=m
         else:self.events.append(m)
+  def stderr_reader(self):
+    for line in self.p.stderr:
+      with self.lock:self.stderr_count+=1
   def call(self,method,params,timeout=25):
     with self.lock:self.seq+=1;rid=self.seq;self.send({'id':rid,'method':method,'params':params})
     end=time.time()+timeout
@@ -64,20 +74,26 @@ class CodexRPC:
         return r.get('result',{})
       if self.p.poll()is not None:raise RuntimeError('Codex App Server 已退出')
       time.sleep(.05)
-    raise RuntimeError('等待 Codex 回执超时；请求状态未知，请勿重发')
+    raise RPCReceiptTimeout(method,rid,self.instance_id)
+  def late_reply(self,request_id):
+    with self.lock:return self.pending.pop(str(request_id),None)
   def models(self):
     r=self.call('model/list',{},15);return r.get('data',r.get('models',[]))
   def start(self,n,prompt):
     req=n['requested'] or n['suggested']; new=not n.get('threadId')
     if new:
-      r=self.call('thread/start',{'model':req['model'],'cwd':n['cwd']});tid=r.get('thread',{}).get('id')
+      try:r=self.call('thread/start',{'model':req['model'],'cwd':n['cwd']})
+      except RPCReceiptTimeout as e:e.phase='thread/start';raise
+      tid=r.get('thread',{}).get('id')
       if not tid:raise RuntimeError('创建任务回执不完整；请求状态未知，请勿重发')
       n['threadId']=tid
     else:
       self.call('thread/resume',{'threadId':n['threadId'],'excludeTurns':True});tid=n['threadId']
     p={'threadId':tid,'input':[{'type':'text','text':prompt,'text_elements':[]}],'model':req['model'],'effort':req['effort'],'clientUserMessageId':n['clientUserMessageId']}
     if new:p['cwd']=n['cwd']
-    r=self.call('turn/start',p,30);turn=r.get('turn',{})
+    try:r=self.call('turn/start',p,30)
+    except RPCReceiptTimeout as e:e.phase='turn/start';e.thread_id=tid;raise
+    turn=r.get('turn',{})
     if not turn.get('id'):raise RuntimeError('派发回执不完整；请求状态未知，请勿重发')
     return tid,turn
   def matching_metadata(self,thread_id,turn_id):
@@ -123,7 +139,17 @@ class App:
     req=n.get('requested')or n.get('suggested')or{}
     if not self.valid_model(req):raise ValueError('模型与 effort 组合当前不可用，未派发')
     oid=str(uuid.uuid4());cid=str(uuid.uuid4());n['operationId']=oid;n['clientUserMessageId']=cid;self.store.data['runsUsed']+=1
-    a={'operationId':oid,'clientUserMessageId':cid,'kind':kind,'revision':n['revision'],'requested':copy.deepcopy(req),'inputSnapshot':prompt,'at':time.time(),'state':'reserved'};n.setdefault('attempts',[]).append(a);self.clear_undo_boundary();return a
+    a={'operationId':oid,'clientUserMessageId':cid,'kind':kind,'revision':n['revision'],'requested':copy.deepcopy(req),'inputSnapshot':prompt,'at':time.time(),'state':'reserved','modelRunReserved':True};n.setdefault('attempts',[]).append(a);self.clear_undo_boundary();return a
+  def record_timeout(self,n,a,e,planning):
+    a.update(state='preparation_failed' if e.phase=='thread/start' else 'receipt_unknown',error=str(e),phase=e.phase,rpcRequestId=e.request_id,rpcInstanceId=e.instance_id,modelTurnStarted=False if e.phase=='thread/start' else 'unknown')
+    if e.phase=='thread/start':
+      self.store.data['runsUsed']-=1;a['modelRunReserved']=False
+      if planning:n['planningStatus']='preparation_failed'
+      else:n['status']='preparation_failed'
+    else:
+      if getattr(e,'thread_id',None):n['threadId']=e.thread_id
+      if planning:n['planningStatus']='receipt_unknown'
+      else:n['status']='receipt_unknown'
   def execute(self,b):
     with self.store.lock:
       n=self.store.node(b.get('nodeId'));prompt=str(b.get('prompt','')).strip()
@@ -138,8 +164,10 @@ class App:
     except Exception as e:
       with self.store.lock:
         msg=str(e);blocked='already has an active writer'in msg
-        n['status']='blocked_not_sent' if blocked else 'receipt_unknown';a['state']=n['status'];a['error']=('桌面任务正在占用，未派发' if blocked else msg)
-        if blocked:self.store.data['runsUsed']-=1
+        if isinstance(e,RPCReceiptTimeout):self.record_timeout(n,a,e,False)
+        else:
+          n['status']='blocked_not_sent' if blocked else 'receipt_unknown';a['state']=n['status'];a['error']=('桌面任务正在占用，未派发' if blocked else msg)
+          if blocked:self.store.data['runsUsed']-=1
         self.store.write()
       raise RuntimeError(a['error'])
     with self.store.lock:n['status']='running';n['turnId']=turn['id'];a.update(state='running',threadId=tid,turnId=turn['id']);self.store.write()
@@ -149,7 +177,9 @@ class App:
     with self.store.lock:
       n=self.store.node(b.get('parentId'))
       if not idea or n.get('locked'):raise ValueError('选择可编辑节点并输入想法')
-      if n.get('planningStatus')in BUSY:raise ValueError('该节点已有规划运行或回执未知')
+      if self.store.data.get('pendingProposal'):raise ValueError('上一份拆分结果还在，先加进去或点“先不用”')
+      pending=any(x.get('rpcRequestId') for x in n.get('attempts',[]))
+      if n.get('planningStatus')in BUSY or (n.get('planningStatus')=='preparation_failed' and pending):raise ValueError('这一步还在核对原来的建对话回执，不能重发')
       locked=[{'id':x['id'],'title':x['title']} for x in self.store.data['nodes'] if x.get('locked')][:20]
       near=[{'id':x['id'],'title':x['title'],'status':x.get('status')} for x in self.store.data['nodes'] if x['id']in n.get('children',[])+n.get('dependsOn',[])][:20]
       ctx={'nodeId':n['id'],'title':n['title'],'delivery':n.get('delivery',''),'acceptance':n.get('acceptance',''),'lockedDecisions':locked,'adjacent':near}
@@ -159,7 +189,10 @@ class App:
     try:tid,turn=self.rpc_client().start(n,prompt)
     except Exception as e:
       with self.store.lock:
-        blocked='already has an active writer'in str(e);n['planningStatus']='blocked_not_sent' if blocked else 'receipt_unknown';a['state']=n['planningStatus'];a['error']=('桌面任务正在占用，未派发' if blocked else str(e));self.store.data['runsUsed']-=1 if blocked else 0;self.store.write()
+        blocked='already has an active writer'in str(e)
+        if isinstance(e,RPCReceiptTimeout):self.record_timeout(n,a,e,True)
+        else:n['planningStatus']='blocked_not_sent' if blocked else 'receipt_unknown';a['state']=n['planningStatus'];a['error']=('桌面任务正在占用，未派发' if blocked else str(e));self.store.data['runsUsed']-=1 if blocked else 0
+        self.store.write()
       raise RuntimeError(a['error'])
     with self.store.lock:n['planningStatus']='running';n['planningTurnId']=turn['id'];a.update(state='running',threadId=tid,turnId=turn['id']);self.store.write()
     return {'turnId':turn['id'],'status':'running'}
@@ -185,6 +218,30 @@ class App:
           if n.get('status')not in FINAL:n['status']='pending_acceptance';n['result']=text;n['actual']=actual;n['usage']=usage
       self.store.write()
     return out
+  def recover_late_reply(self,b):
+    with self.store.lock:
+      n=self.store.node(b.get('nodeId'));a=next((x for x in reversed(n.get('attempts',[])) if x.get('rpcRequestId')),None)
+      if not a:raise ValueError('没有可恢复的迟到回执')
+      rpc=self.rpc_client()
+      if a.get('rpcInstanceId')!=getattr(rpc,'instance_id',None):return {'status':'unavailable','message':'原来的 Codex 进程已结束，不能把新进程的回执当成旧回执'}
+      reply=rpc.late_reply(a['rpcRequestId'])
+      if not reply:return {'status':'waiting','message':'还没收到原来的回执，不会重发'}
+      if reply.get('error'):a['error']=reply['error'].get('message','Codex 返回错误');self.store.write();return {'status':'error','message':a['error']}
+      if a.get('phase')=='thread/start':
+        tid=reply.get('result',{}).get('thread',{}).get('id')
+        if not tid:raise ValueError('迟到回执没有对话编号，仍不重发')
+        n['threadId']=tid;a['state']='recovered';a['lateReplyAt']=time.time();a['recoveredRequestId']=a.pop('rpcRequestId');a.pop('rpcInstanceId',None)
+        if a.get('kind')=='planning':n['planningStatus']='preparation_recovered'
+        else:n['status']='ready'
+        self.store.write();return {'status':'thread_ready','message':'已收到原来的对话编号；原要求没有发出'}
+      if a.get('phase')=='turn/start':
+        turn=reply.get('result',{}).get('turn',{});tid=turn.get('id')
+        if not tid:raise ValueError('迟到回执没有执行编号，仍不重发')
+        a.update(state='running',turnId=tid,lateReplyAt=time.time())
+        if a.get('kind')=='planning':n['planningStatus']='running';n['planningTurnId']=tid
+        else:n['status']='running';n['turnId']=tid
+        self.store.write();return {'status':'running','message':'已收到原来的执行编号，正在继续'}
+      return {'status':'waiting','message':'收到的不是可恢复的建对话回执'}
   def validate_proposal(self,p):
     xs=p.get('nodes')if isinstance(p,dict)else None
     if not isinstance(xs,list)or not xs:raise ValueError('提案没有节点')
@@ -205,7 +262,12 @@ class App:
         prepared.append(dict(id=mapping[x['tempId']],kind=x['kind'],title=x['title'],locked=False,status='ready',revision=1,project=parent.get('project',''),threadId='',cwd=parent.get('cwd',str(ROOT)),suggested=x.get('suggested',{'model':'gpt-5.6-luna','effort':'low'}),requested={},actual={},delivery=x.get('delivery',''),acceptance=x.get('acceptance',''),dependsOn=deps,children=[],attempts=[],artifacts=[]))
       def cycle(v,path):return v in path or any(cycle(q,path|{v})for q in graph.get(v,[]))
       if any(cycle(v,set())for v in graph):raise ValueError('提案依赖形成循环')
-      self.clear_undo_boundary();self.store.data['nodes'].extend(prepared);parent.setdefault('children',[]).extend(x['id']for x in prepared);parent['revision']+=1;self.store.data.setdefault('appliedProposalTurns',[]).append(p['turnId']);del self.store.data['pendingProposal'];self.store.write();return {'applied':prepared}
+      self.clear_undo_boundary();self.store.data['nodes'].extend(prepared);parent.setdefault('children',[]).extend(x['id']for x in prepared);parent['revision']+=1;parent['planningStatus']='applied';self.store.data.setdefault('appliedProposalTurns',[]).append(p['turnId']);del self.store.data['pendingProposal'];self.store.write();return {'applied':prepared}
+  def discard_proposal(self,b):
+    with self.store.lock:
+      p=self.store.data.get('pendingProposal')
+      if not p or p.get('proposalId')!=b.get('proposalId'):raise ValueError('这份拆分结果已不在待处理列表')
+      parent=self.store.node(p['parentId']);self.clear_undo_boundary();parent['planningStatus']='discarded';parent['planningTurnId']=None;del self.store.data['pendingProposal'];self.store.write();return {'discarded':True,'parentId':parent['id']}
   def edit_node(self,b):
     with self.store.lock:
       n=self.store.node(b.get('nodeId'))
@@ -222,7 +284,9 @@ class App:
     with self.store.lock:
       p=self.store.node(b.get('parentId'))
       if p.get('locked')or p.get('planningStatus')in BUSY:raise ValueError('父节点当前不能添加')
-      i='node_'+uuid.uuid4().hex[:10];n=copy.deepcopy(initial_state()['nodes'][1]);n.update(id=i,title=str(b.get('title')or'新的待评审节点')[:120],kind=b.get('kind','idea'),children=[]);self.store.data['nodes'].append(n);p.setdefault('children',[]).append(i);p['revision']+=1;self.undo.append({'type':'add','id':i,'parentId':p['id'],'parentRevision':p['revision']});self.store.write();return n
+      kind=b.get('kind','execution')
+      if kind not in {'execution','evidence','idea','decision'}:raise ValueError('这一步的类型不支持')
+      i='node_'+uuid.uuid4().hex[:10];n=copy.deepcopy(initial_state()['nodes'][1]);n.update(id=i,title=str(b.get('title')or'新的待评审节点')[:120],kind=kind,children=[]);self.store.data['nodes'].append(n);p.setdefault('children',[]).append(i);p['revision']+=1;self.undo.append({'type':'add','id':i,'parentId':p['id'],'parentRevision':p['revision']});self.store.write();return n
   def undo_edit(self):
     with self.store.lock:
       if not self.undo:raise ValueError('没有可撤销的纯编辑')
@@ -253,6 +317,8 @@ class App:
 def make_handler(app,token):
  class H(SimpleHTTPRequestHandler):
   def log_message(self,*a):pass
+  def end_headers(self):
+   self.send_header('Cache-Control','no-store');super().end_headers()
   def safe(self):
    h=self.headers.get('Host','');o=self.headers.get('Origin','');base=f'127.0.0.1:{self.server.server_port}';return h in(base,f'localhost:{self.server.server_port}')and(not o or o in(f'http://{base}',f'http://localhost:{self.server.server_port}'))
   def sendj(self,c,x):
@@ -268,7 +334,7 @@ def make_handler(app,token):
    if not self.safe()or self.headers.get('X-CSRF-Token')!=token:return self.sendj(403,{'error':'来源或CSRF校验失败'})
    try:b=json.loads(self.rfile.read(int(self.headers.get('Content-Length','0'))))
    except Exception:return self.sendj(400,{'error':'请求不是JSON'})
-   routes={'/api/execute':app.execute,'/api/plan':app.plan,'/api/refresh':app.refresh,'/api/apply-proposal':app.apply_proposal,'/api/node/edit':app.edit_node,'/api/node/add':app.add_child,'/api/undo':lambda _:app.undo_edit(),'/api/accept':lambda x:app.accept(x,True),'/api/return':lambda x:app.accept(x,False),'/api/human-confirm':app.human_confirm}
+   routes={'/api/execute':app.execute,'/api/plan':app.plan,'/api/refresh':app.refresh,'/api/recover-late-reply':app.recover_late_reply,'/api/apply-proposal':app.apply_proposal,'/api/discard-proposal':app.discard_proposal,'/api/node/edit':app.edit_node,'/api/node/add':app.add_child,'/api/undo':lambda _:app.undo_edit(),'/api/accept':lambda x:app.accept(x,True),'/api/return':lambda x:app.accept(x,False),'/api/human-confirm':app.human_confirm}
    try:
     if self.path not in routes:return self.sendj(404,{'error':'不允许的操作'})
     self.sendj(200,routes[self.path](b))

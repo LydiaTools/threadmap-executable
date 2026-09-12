@@ -17,3 +17,5 @@ dist/
 coverage/
 *.bak
 *.backup
+
+macos/build/
