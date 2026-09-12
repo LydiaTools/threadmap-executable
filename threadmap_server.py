@@ -80,6 +80,7 @@ class CodexRPC:
   def models(self):
     r=self.call('model/list',{},15);return r.get('data',r.get('models',[]))
   def start(self,n,prompt):
+    if str(Path(n['cwd']).resolve()) not in ALLOWED_CWDS:raise ValueError('该项目目录尚未允许执行')
     req=n['requested'] or n['suggested']; new=not n.get('threadId')
     if new:
       try:r=self.call('thread/start',{'model':req['model'],'cwd':n['cwd']})
@@ -90,7 +91,10 @@ class CodexRPC:
     else:
       self.call('thread/resume',{'threadId':n['threadId'],'excludeTurns':True});tid=n['threadId']
     p={'threadId':tid,'input':[{'type':'text','text':prompt,'text_elements':[]}],'model':req['model'],'effort':req['effort'],'clientUserMessageId':n['clientUserMessageId']}
-    if new:p['cwd']=n['cwd']
+    p['cwd']=n['cwd']
+    attempts=n.get('attempts') or [{}]
+    p['sandboxPolicy']=({'type':'workspaceWrite','writableRoots':[n['cwd']],'networkAccess':False} if attempts[-1].get('kind')=='execution' else {'type':'readOnly'})
+    p['approvalPolicy']='on-request'
     try:r=self.call('turn/start',p,30)
     except RPCReceiptTimeout as e:e.phase='turn/start';e.thread_id=tid;raise
     turn=r.get('turn',{})
@@ -118,16 +122,20 @@ class CodexRPC:
     return actual,usage
 
 class App:
-  def __init__(self,store,rpc_factory=CodexRPC):self.store=store;self.rpc_factory=rpc_factory;self.rpc=None;self.rpc_lock=threading.Lock();self.undo=[];self.model_caps=None
+  def __init__(self,store,rpc_factory=CodexRPC):self.store=store;self.rpc_factory=rpc_factory;self.rpc=None;self.model_rpc=None;self.rpc_lock=threading.Lock();self.undo=[];self.model_caps=None
   def rpc_client(self):
     with self.rpc_lock:
       if not self.rpc or self.rpc.p.poll()is not None:self.rpc=self.rpc_factory()
       return self.rpc
+  def model_client(self):
+    with self.rpc_lock:
+      if not self.model_rpc or self.model_rpc.p.poll()is not None:self.model_rpc=self.rpc_factory()
+      return self.model_rpc
   def clear_undo_boundary(self):self.undo.clear()
   def state(self):return self.store.data
   def models(self):
     try:
-      ms=self.rpc_client().models();self.model_caps={m['id']:{e['reasoningEffort'] if isinstance(e,dict) else e for e in m.get('supportedReasoningEfforts',[])} for m in ms};return {'models':ms,'connected':True}
+      ms=self.model_client().models();self.model_caps={m['id']:{e['reasoningEffort'] if isinstance(e,dict) else e for e in m.get('supportedReasoningEfforts',[])} for m in ms};return {'models':ms,'connected':True}
     except Exception as e:return {'models':[],'connected':False,'error':str(e)}
   def valid_model(self,req):
     if not self.model_caps:self.models()
@@ -156,8 +164,10 @@ class App:
       if n.get('kind')!='execution' or n.get('status')!='ready':raise ValueError('只有就绪的执行节点可以派发')
       if b.get('revision')!=n['revision'] or not prompt:raise ValueError('节点版本变化或缺少执行要求')
       for d in n.get('dependsOn',[]):
-        if self.store.node(d).get('status')!='passed':raise ValueError('依赖节点尚未通过，未派发')
-      redo=sum(a.get('kind')=='execution' for a in n.get('attempts',[]))-1
+        dependency=self.store.node(d)
+        approved_idea=dependency.get('kind')=='idea' and dependency.get('planningStatus')=='applied'
+        if dependency.get('status')!='passed' and not approved_idea:raise ValueError('依赖节点尚未通过，未派发')
+      redo=sum(a.get('kind')=='execution' and a.get('modelRunReserved') is not False for a in n.get('attempts',[]))-1
       if redo>=self.store.data['limits']['maxRedo'] and n.get('attempts'):raise ValueError('已到最大返工次数，未派发')
       a=self.reserve(n,'execution',prompt);n['status']='sent';self.store.write()
     try:tid,turn=self.rpc_client().start(n,prompt)

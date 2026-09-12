@@ -20,6 +20,39 @@ class FakeRPC:
         return {}
 
 class ControllerAcceptance(unittest.TestCase):
+    def test_approved_idea_satisfies_planning_dependency(self):
+        self.store.node('idea')['planningStatus']='applied'
+        self.n['dependsOn']=['idea']
+        self.app.execute({'nodeId':'plan','revision':self.n['revision'],'prompt':'test'})
+        self.assertEqual(self.n['status'],'running')
+    def test_planning_does_not_complete_execution_dependency(self):
+        dependency=self.store.node('idea');dependency.update(kind='execution',planningStatus='applied',status='ready')
+        self.n['dependsOn']=['idea']
+        with self.assertRaisesRegex(ValueError,'依赖节点'):
+            self.app.execute({'nodeId':'plan','revision':self.n['revision'],'prompt':'test'})
+    def test_execution_gets_only_project_write_scope(self):
+        rpc=object.__new__(s.CodexRPC);calls=[]
+        def call(method,params,*args):
+            calls.append((method,params));return {'thread':{'id':'t'},'turn':{'id':'v'}}
+        rpc.call=call
+        n=copy.deepcopy(self.n);n['attempts']=[{'kind':'execution'}]
+        n['clientUserMessageId']='check';rpc.start(n,'write file')
+        params=calls[-1][1]
+        self.assertEqual(params['sandboxPolicy'],{'type':'workspaceWrite','writableRoots':[n['cwd']],'networkAccess':False})
+        self.assertEqual(params['approvalPolicy'],'on-request')
+    def test_planning_stays_read_only(self):
+        rpc=object.__new__(s.CodexRPC);calls=[]
+        rpc.call=lambda method,params,*args: (calls.append((method,params)) or {'thread':{'id':'t'},'turn':{'id':'v'}})
+        n=copy.deepcopy(self.n);n['attempts']=[{'kind':'planning'}];n['clientUserMessageId']='check'
+        rpc.start(n,'plan');self.assertEqual(calls[-1][1]['sandboxPolicy'],{'type':'readOnly'})
+    def test_unapproved_working_directory_cannot_start(self):
+        rpc=object.__new__(s.CodexRPC);n=copy.deepcopy(self.n);n['cwd']='/tmp'
+        with self.assertRaisesRegex(ValueError,'项目目录'):rpc.start(n,'test')
+    def test_rejected_requests_do_not_consume_redo_allowance(self):
+        self.store.data['limits']['maxRedo']=1
+        self.n['attempts']=[{'kind':'execution','modelRunReserved':True},{'kind':'execution','modelRunReserved':False},{'kind':'execution','modelRunReserved':False}]
+        self.app.execute({'nodeId':'plan','revision':self.n['revision'],'prompt':'retry'})
+        self.assertEqual(self.n['status'],'running')
     def test_initial_nodes_have_independent_mutable_collections(self):
         data=s.initial_state(); nodes=data['nodes']
         for field in ('attempts','artifacts','children','dependsOn'):
@@ -35,6 +68,18 @@ class ControllerAcceptance(unittest.TestCase):
         self.app.edit_node({'nodeId':'plan','revision':self.n['revision'],'requested':{'model':'gpt-5.6-terra','effort':'medium'}})
         self.app.execute({'nodeId':'plan','revision':self.n['revision'],'prompt':'test'})
         self.assertEqual(self.rpc.calls[-1]['requested'],{'model':'gpt-5.6-terra','effort':'medium'})
+    def test_model_listing_does_not_reuse_execution_rpc(self):
+        made=[]
+        def factory():
+            rpc=FakeRPC();made.append(rpc);return rpc
+        app=s.App(self.store,factory)
+        app.models()
+        app.execute({'nodeId':'plan','revision':self.n['revision'],'prompt':'test'})
+        self.assertEqual(len(made),2)
+        self.assertIs(app.model_rpc,made[0])
+        self.assertIs(app.rpc,made[1])
+        self.assertEqual(made[0].calls,[])
+        self.assertEqual(len(made[1].calls),1)
     def test_refresh_keeps_accepted_result(self):
         self.n.update(status='passed',threadId='local-test',turnId='turn-test',result='OK')
         self.n['attempts']=[{'state':'completed','revision':self.n['revision'],'turnId':'turn-test'}]
