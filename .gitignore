@@ -1,0 +1,19 @@
+# Local execution state and evidence never enter source history.
+threadmap_state*.json
+threadmap_state*.tmp
+运行模型核验.json
+*.log
+*.pid
+*.sock
+__pycache__/
+*.py[cod]
+.DS_Store
+.env
+.env.*
+!.env.example
+.venv/
+node_modules/
+dist/
+coverage/
+*.bak
+*.backup
